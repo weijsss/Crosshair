@@ -162,7 +162,7 @@ class App:
     def __init__(self):
         self.cfg = load()
         self.root = tk.Tk()
-        self.root.title("外置准星")
+        self.root.title("Crosshair")
         self.root.resizable(False, False)
         self.root.configure(bg=BG)
 
@@ -526,7 +526,7 @@ def main():
     k = ctypes.windll.kernel32
     k.CreateMutexW(None, True, "Global\\Crosshair_Mutex_v2")
     if k.GetLastError() == 183:
-        ctypes.windll.user32.MessageBoxW(0, "准星已在运行中!", "外置准星", 0x40)
+        ctypes.windll.user32.MessageBoxW(0, "Crosshair 已在运行中!", "Crosshair", 0x40)
         sys.exit(0)
     App().run()
 

@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='外置准星',
+    name='Crosshair',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
