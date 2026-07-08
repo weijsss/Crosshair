@@ -3,10 +3,12 @@
 Apple-style dark theme, custom radio & checkbox widgets.
 """
 import tkinter as tk
+from tkinter import colorchooser
 import json
 import os
 import sys
 import webbrowser
+import ctypes
 
 if getattr(sys, 'frozen', False):
     DIR = os.path.dirname(sys.executable)
@@ -19,6 +21,7 @@ ICON = os.path.join(DIR, "crosshair.ico")
 DEFAULT = {
     "color": "#00FF00", "alpha": 0.85, "size": 20,
     "thickness": 2, "gap": 4, "style": "cross", "visible": True,
+    "offset_x": 0, "offset_y": 0,
 }
 
 COLORS = [
@@ -172,7 +175,7 @@ class App:
             except:
                 pass
 
-        pw, ph = 340, 700
+        pw, ph = 340, 790
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         self.root.geometry(f"{pw}x{ph}+{sw - pw - 30}+{sh - ph - 80}")
@@ -228,10 +231,19 @@ class App:
             inner = tk.Canvas(f, width=s, height=s, bg=c, bd=0,
                               highlightthickness=0, cursor="hand2")
             inner.pack()
-            # white ring for selected color
             if c == self.cfg["color"]:
                 inner.create_oval(2, 2, s - 2, s - 2, outline="#fff", width=2)
             inner.bind("<Button-1>", lambda e, x=c: self._set_color(x))
+        # custom color button
+        sf2 = tk.Frame(cf, bg=CARD, padx=0, pady=0)
+        sf2.grid(row=0, column=len(COLORS), padx=3)
+        self._cc = tk.Canvas(sf2, width=26, height=26,
+                             bg=self.cfg["color"], bd=0,
+                             highlightthickness=0, cursor="hand2")
+        self._cc.pack()
+        self._cc.create_line(8, 13, 18, 13, fill="#fff", width=2)
+        self._cc.create_line(13, 8, 13, 18, fill="#fff", width=2)
+        self._cc.bind("<Button-1>", self._pick_color)
 
         # sliders
         self._label(main, "参数")
@@ -242,6 +254,13 @@ class App:
         self._mk_slider(sf3, "粗细", "thickness", 1, 12, 1)
         self._mk_slider(sf3, "间隙", "gap", 0, 30, 2)
         self._mk_slider(sf3, "透明度", "alpha", 20, 100, 3, True)
+
+        # position
+        self._label(main, "位置")
+        pf4 = tk.Frame(main, bg=CARD, padx=10, pady=8)
+        pf4.pack(fill="x", pady=(0, 12))
+        self._mk_slider(pf4, "水平", "offset_x", -300, 300, 0)
+        self._mk_slider(pf4, "垂直", "offset_y", -300, 300, 1)
 
         # force topmost
         self._label(main, "覆盖")
@@ -286,23 +305,47 @@ class App:
         var = tk.IntVar(value=v)
         setattr(self, f"_v_{key}", var)
         tk.Scale(f, from_=mn, to=mx, orient="horizontal", variable=var,
-                 length=185, showvalue=False,
+                 length=155, showvalue=False,
                  bg=CARD, fg=CARD, troughcolor=SEP,
                  activebackground=ACCENT, highlightthickness=0, bd=0,
                  command=lambda _, k=key, a=alpha: self._on_slide(k, a)
                  ).pack(side="left")
-        lbl = tk.Label(f, width=4, anchor="w", fg=SUBTLE, bg=CARD,
-                       font=("Microsoft YaHei UI", 9))
-        lbl.pack(side="left", padx=(4, 0))
-        self._labs[key] = (lbl, alpha)
+        ent = tk.Entry(f, width=5, fg=TEXT, bg=PREVIEW,
+                       insertbackground=TEXT, bd=0,
+                       font=("Microsoft YaHei UI", 9), justify="center")
+        ent.pack(side="left", padx=(4, 0))
+        ent.bind("<Return>", lambda e, k=key, a=alpha, m=mn, x=mx:
+                 self._on_entry(k, a, m, x))
+        ent.bind("<FocusOut>", lambda e, k=key, a=alpha, m=mn, x=mx:
+                 self._on_entry(k, a, m, x))
+        self._labs[key] = (ent, alpha, mn, mx)
         self._upd_lab(key, alpha)
 
     def _upd_lab(self, key, alpha):
         if key not in self._labs:
             return
-        lbl, af = self._labs[key]
+        ent, af, _, _ = self._labs[key]
         v = getattr(self, f"_v_{key}").get()
-        lbl.config(text=f"{v}%" if af else str(v))
+        t = f"{v}%{'' if af else ''}" if af else str(v)
+        # don't update while user is editing
+        if ent.get() != t:
+            ent.delete(0, "end")
+            ent.insert(0, t)
+
+    def _on_entry(self, key, alpha, mn, mx):
+        ent, _, _, _ = self._labs[key]
+        try:
+            raw = ent.get().replace("%", "")
+            v = int(raw)
+            v = max(mn, min(mx, v))
+            var = getattr(self, f"_v_{key}")
+            var.set(v)
+            self.cfg[key] = v / 100.0 if alpha else v
+            self._upd_lab(key, alpha)
+            self._refresh()
+            self._apply_to_overlay()
+        except ValueError:
+            self._upd_lab(key, alpha)
 
     def _on_slide(self, key, alpha):
         if key not in self._labs:
@@ -311,12 +354,18 @@ class App:
         self.cfg[key] = v / 100.0 if alpha else v
         self._upd_lab(key, alpha)
         self._refresh()
-        if key == "alpha":
-            self._apply_to_overlay()
+        self._apply_to_overlay()
 
     def _set_color(self, c):
         self.cfg["color"] = c
         self._refresh()
+
+    def _pick_color(self, *a):
+        c = colorchooser.askcolor(color=self.cfg["color"],
+                                  title="选择颜色")
+        if c[1]:
+            self._set_color(c[1])
+            self._cc.configure(bg=c[1])
 
     # ------------------------------------------------------------------
     def _refresh(self):
@@ -409,6 +458,13 @@ class App:
         self._ov.attributes("-topmost", True)
         self._ov.protocol("WM_DELETE_WINDOW", lambda: None)
 
+        # 鼠标穿透: WS_EX_TRANSPARENT | WS_EX_LAYERED
+        self._ov.update()
+        hwnd = ctypes.windll.user32.GetParent(self._ov.winfo_id())
+        ex = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+        ctypes.windll.user32.SetWindowLongW(hwnd, -20,
+            ex | 0x00000020 | 0x00080000)
+
         self._cv = tk.Canvas(self._ov, width=self.sw, height=self.sh,
                              bg="black", bd=0, highlightthickness=0)
         self._cv.pack()
@@ -423,7 +479,9 @@ class App:
         for i in self._ci:
             self._cv.delete(i)
         self._ci.clear()
-        cx, cy = self.sw // 2, self.sh // 2
+        ox = int(self.cfg.get("offset_x", 0))
+        oy = int(self.cfg.get("offset_y", 0))
+        cx, cy = self.sw // 2 + ox, self.sh // 2 + oy
         c = self.cfg["color"]
         s = int(self.cfg["size"])
         w = int(self.cfg["thickness"])
@@ -522,7 +580,6 @@ class App:
 
 
 def main():
-    import ctypes
     k = ctypes.windll.kernel32
     k.CreateMutexW(None, True, "Global\\Crosshair_Mutex_v2")
     if k.GetLastError() == 183:
