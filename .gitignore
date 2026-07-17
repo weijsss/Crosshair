@@ -1,7 +1,14 @@
-build/
-dist/
-__pycache__/
-*.pyc
-*.pyo
-*.spec.bak
+# Build artifacts
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# CMake build directory
+cpp/build/
+
+# Output binary
+cpp/bin/
+
+# Config (user data)
 crosshair_config.json
