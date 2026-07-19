@@ -1,28 +1,405 @@
 #include "settings.h"
 #include "render.h"
+#include "resource.h"
 #include <algorithm>
 #include <cstring>
 #include <commdlg.h>
-#include <shlobj.h>
+#include <shellapi.h>
 #include <uxtheme.h>
+#include <dwmapi.h>
 
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
 
-// ---- Apple dark palette (BGR) ----
-static const COLORREF BG      = 0x1E1C1C;
-static const COLORREF CARD    = 0x2E2C2C;
-static const COLORREF TEXT_C  = 0xF7F5F5;
-static const COLORREF ACCENT  = 0xFF840A;
-static const COLORREF GREEN_C = 0x58D130;
-static const COLORREF PREV    = 0x000000;
-static const COLORREF RING    = 0x666363;
+#define WM_TRAYICON (WM_APP + 1)
+#define TIMER_UPDATE 1
 
-static HFONT g_font, g_font_title;
+enum { ID_TRAY_SHOW = 1200, ID_TRAY_EXIT = 1201 };
+
+// ---- modern dark palette ----
+static const COLORREF BG      = RGB(24, 25, 29);
+static const COLORREF CARD    = RGB(37, 39, 45);
+static const COLORREF CARD2   = RGB(50, 53, 61);
+static const COLORREF PRESS   = RGB(28, 30, 35);
+static const COLORREF TEXT_C  = RGB(240, 241, 244);
+static const COLORREF SUBT    = RGB(146, 150, 160);
+static const COLORREF ACCENT  = RGB(10, 132, 255);
+static const COLORREF ACC_HOV = RGB(48, 158, 255);
+static const COLORREF GREEN_C = RGB(48, 209, 88);
+static const COLORREF PREV    = RGB(15, 16, 19);
+static const COLORREF RING    = RGB(64, 67, 76);
+static const COLORREF GRID    = RGB(46, 48, 56);
+
+static HFONT g_font, g_font_sm, g_font_title, g_font_sec;
 static HBRUSH g_bg_brush, g_card_brush, g_prev_brush;
 
+// ---- custom control messages ----
+#define XBM_SETSTYLE  (WM_USER + 401)   // 0 normal, 1 accent, 2 subtle
+#define XBM_SETSELECT (WM_USER + 402)
+
+static const wchar_t* XSLIDER_CLASS = L"XSliderCtrl";
+static const wchar_t* XTOGGLE_CLASS = L"XToggleCtrl";
+static const wchar_t* XBTN_CLASS    = L"XBtnCtrl";
+
+static Gdiplus::Color gcol(COLORREF c, BYTE a = 255) {
+    return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
+}
+
+static void gdi_round_rect(Gdiplus::Graphics& g, Gdiplus::Brush* br, Gdiplus::Pen* pen,
+                           float x, float y, float w, float h, float r) {
+    if (w <= 0 || h <= 0) return;
+    Gdiplus::GraphicsPath path;
+    float d = (std::min)(r * 2, (std::min)(w, h));
+    path.AddArc(x, y, d, d, 180, 90);
+    path.AddArc(x + w - d, y, d, d, 270, 90);
+    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+    path.AddArc(x, y + h - d, d, d, 90, 90);
+    path.CloseFigure();
+    if (br) g.FillPath(br, &path);
+    if (pen) g.DrawPath(pen, &path);
+}
+
+// Paint into an offscreen bitmap, then blit to target DC.
+// painter receives the mem HDC; GDI+ must be scoped so GDI text works after.
+template <typename F>
+static void paint_dc(HDC target, int tx, int ty, int w, int h, F&& painter) {
+    HDC mem = CreateCompatibleDC(target);
+    HBITMAP bmp = CreateCompatibleBitmap(target, w, h);
+    HGDIOBJ ob = SelectObject(mem, bmp);
+    painter(mem, w, h);
+    BitBlt(target, tx, ty, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, ob);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+}
+
+// Double-buffered WM_PAINT helper for custom control windows
+template <typename F>
+static void paint_window(HWND hwnd, F&& painter) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+    RECT rc; GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w > 0 && h > 0) paint_dc(hdc, 0, 0, w, h, painter);
+    EndPaint(hwnd, &ps);
+}
+
+static void track_leave(HWND hwnd) {
+    TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+    TrackMouseEvent(&tme);
+}
+
+// ================= XSlider =================
+struct SliderState { int minv = 0, maxv = 100, val = 0; bool drag = false, hover = false; };
+
+static void slider_notify(HWND hwnd, int code) {
+    HWND p = GetParent(hwnd);
+    auto* st = (SliderState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    SendMessage(p, WM_HSCROLL, MAKEWPARAM(code, st->val), (LPARAM)hwnd);
+}
+
+static void slider_set_from_x(HWND hwnd, SliderState* st, int x) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    float pad = 11.0f;
+    float x0 = pad, x1 = (float)(rc.right) - pad;
+    float t = (x1 > x0) ? (float)(x - x0) / (x1 - x0) : 0;
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    int v = st->minv + (int)(t * (st->maxv - st->minv) + 0.5f);
+    if (v < st->minv) v = st->minv;
+    if (v > st->maxv) v = st->maxv;
+    if (v != st->val) {
+        st->val = v;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        slider_notify(hwnd, SB_THUMBTRACK);
+    }
+}
+
+static LRESULT CALLBACK xslider_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = (SliderState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)(new SliderState()));
+        return DefWindowProcW(hwnd, msg, wp, lp); // default proc stores window text
+    case WM_NCDESTROY:
+        delete st;
+        return 0;
+    case TBM_SETRANGE:
+        st->minv = (short)LOWORD(lp); st->maxv = (short)HIWORD(lp);
+        if (st->val < st->minv) st->val = st->minv;
+        if (st->val > st->maxv) st->val = st->maxv;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case TBM_SETPOS:
+        st->val = (int)lp;
+        if (st->val < st->minv) st->val = st->minv;
+        if (st->val > st->maxv) st->val = st->maxv;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case TBM_GETPOS:
+        return st->val;
+    case WM_LBUTTONDOWN:
+        SetFocus(hwnd);
+        st->drag = true;
+        SetCapture(hwnd);
+        slider_set_from_x(hwnd, st, (int)(short)LOWORD(lp));
+        return 0;
+    case WM_MOUSEMOVE:
+        if (!st->hover) { st->hover = true; track_leave(hwnd); InvalidateRect(hwnd, nullptr, FALSE); }
+        if (st->drag) slider_set_from_x(hwnd, st, (int)(short)LOWORD(lp));
+        return 0;
+    case WM_MOUSELEAVE:
+        st->hover = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP:
+        if (st->drag) {
+            st->drag = false;
+            ReleaseCapture();
+            slider_notify(hwnd, SB_THUMBPOSITION);
+        }
+        return 0;
+    case WM_MOUSEWHEEL: {
+        int d = (int)(short)HIWORD(wp);
+        int v = st->val + (d > 0 ? 1 : -1);
+        if (v < st->minv) v = st->minv;
+        if (v > st->maxv) v = st->maxv;
+        if (v != st->val) {
+            st->val = v;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            slider_notify(hwnd, SB_THUMBPOSITION);
+        }
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        int v = st->val;
+        if (wp == VK_LEFT || wp == VK_DOWN) v--;
+        else if (wp == VK_RIGHT || wp == VK_UP) v++;
+        else break;
+        if (v < st->minv) v = st->minv;
+        if (v > st->maxv) v = st->maxv;
+        if (v != st->val) {
+            st->val = v;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            slider_notify(hwnd, SB_THUMBPOSITION);
+        }
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        paint_window(hwnd, [&](HDC mem, int w, int h) {
+            Gdiplus::Graphics g(mem);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            Gdiplus::SolidBrush bgbr(gcol(BG));
+            g.FillRectangle(&bgbr, 0, 0, w, h);
+            float cy = h / 2.0f, pad = 11.0f;
+            float x0 = pad, x1 = (float)w - pad;
+            float t = (st->maxv > st->minv) ? (float)(st->val - st->minv) / (st->maxv - st->minv) : 0;
+            float tx = x0 + t * (x1 - x0);
+            // track
+            Gdiplus::SolidBrush trbr(gcol(CARD2));
+            gdi_round_rect(g, &trbr, nullptr, x0, cy - 2.5f, x1 - x0, 5, 2.5f);
+            // filled portion
+            if (tx > x0 + 1) {
+                Gdiplus::SolidBrush fbr(gcol(ACCENT));
+                gdi_round_rect(g, &fbr, nullptr, x0, cy - 2.5f, tx - x0, 5, 2.5f);
+            }
+            // thumb
+            float r = (st->hover || st->drag) ? 8.5f : 7.5f;
+            Gdiplus::SolidBrush wbr(Gdiplus::Color(255, 250, 250, 252));
+            Gdiplus::Pen rp(gcol(RING), 1.2f);
+            g.FillEllipse(&wbr, tx - r, cy - r, r * 2, r * 2);
+            g.DrawEllipse(&rp, tx - r, cy - r, r * 2, r * 2);
+        });
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ================= XToggle =================
+struct ToggleState { bool checked = false, hover = false; };
+
+static LRESULT CALLBACK xtoggle_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = (ToggleState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)(new ToggleState()));
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_NCDESTROY:
+        delete st;
+        return 0;
+    case BM_SETCHECK:
+        st->checked = (wp == BST_CHECKED);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case BM_GETCHECK:
+        return st->checked ? BST_CHECKED : BST_UNCHECKED;
+    case WM_MOUSEMOVE:
+        if (!st->hover) { st->hover = true; track_leave(hwnd); InvalidateRect(hwnd, nullptr, FALSE); }
+        return 0;
+    case WM_MOUSELEAVE:
+        st->hover = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP:
+        st->checked = !st->checked;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        SendMessage(GetParent(hwnd), WM_COMMAND,
+            MAKEWPARAM(GetDlgCtrlID(hwnd), BN_CLICKED), (LPARAM)hwnd);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        paint_window(hwnd, [&](HDC mem, int w, int h) {
+            Gdiplus::Graphics g(mem);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            Gdiplus::SolidBrush bgbr(gcol(BG));
+            g.FillRectangle(&bgbr, 0, 0, w, h);
+            float th = 22.0f, tw = 40.0f;
+            float x = 2.0f, y = (h - th) / 2.0f;
+            if (st->checked) {
+                Gdiplus::SolidBrush br(gcol(st->hover ? ACC_HOV : ACCENT));
+                gdi_round_rect(g, &br, nullptr, x, y, tw, th, th / 2);
+            } else {
+                Gdiplus::SolidBrush br(gcol(st->hover ? CARD2 : CARD));
+                Gdiplus::Pen pn(gcol(RING), 1.2f);
+                gdi_round_rect(g, &br, &pn, x, y, tw, th, th / 2);
+            }
+            float kd = 16.0f;
+            float kx = st->checked ? (x + tw - kd - 3) : (x + 3);
+            Gdiplus::SolidBrush kbr(Gdiplus::Color(255, 250, 250, 252));
+            g.FillEllipse(&kbr, kx, y + (th - kd) / 2, kd, kd);
+        });
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ================= XButton =================
+struct BtnState { bool hover = false, pressed = false, selected = false; int style = 0; };
+
+static LRESULT CALLBACK xbtn_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = (BtnState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE: {
+        auto* st = new BtnState();
+        st->style = (int)(INT_PTR)((CREATESTRUCTW*)lp)->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    case WM_NCDESTROY:
+        delete st;
+        return 0;
+    case XBM_SETSTYLE:
+        st->style = (int)wp;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case XBM_SETSELECT:
+        st->selected = (wp != 0);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (!st->hover) { st->hover = true; track_leave(hwnd); InvalidateRect(hwnd, nullptr, FALSE); }
+        return 0;
+    case WM_MOUSELEAVE:
+        st->hover = false; st->pressed = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN:
+        st->pressed = true;
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP: {
+        bool was = st->pressed;
+        st->pressed = false;
+        ReleaseCapture();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        if (was) {
+            POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+            RECT rc; GetClientRect(hwnd, &rc);
+            if (PtInRect(&rc, pt)) {
+                SendMessage(GetParent(hwnd), WM_COMMAND,
+                    MAKEWPARAM(GetDlgCtrlID(hwnd), BN_CLICKED), (LPARAM)hwnd);
+            }
+        }
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        paint_window(hwnd, [&](HDC mem, int w, int h) {
+            COLORREF fillc = CARD, textc = TEXT_C, borderc = RING;
+            bool draw_border = true;
+            if (st->style == 1) {          // accent
+                fillc = st->pressed ? ACCENT : (st->hover ? ACC_HOV : ACCENT);
+                borderc = fillc;
+            } else if (st->style == 2) {   // subtle (link)
+                draw_border = false;
+                fillc = BG;
+                textc = st->hover ? ACCENT : SUBT;
+            } else {                       // normal
+                if (st->pressed) fillc = PRESS;
+                else if (st->hover) fillc = CARD2;
+            }
+            if (st->selected) { borderc = ACCENT; textc = ACCENT; }
+
+            {
+                Gdiplus::Graphics g(mem);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                Gdiplus::SolidBrush bgbr(gcol(BG));
+                g.FillRectangle(&bgbr, 0, 0, w, h);
+                Gdiplus::SolidBrush fbr(gcol(fillc));
+                Gdiplus::Pen bpen(gcol(borderc), st->selected ? 1.6f : 1.0f);
+                gdi_round_rect(g, &fbr, draw_border || st->selected ? &bpen : nullptr,
+                               0.5f, 0.5f, w - 1.0f, h - 1.0f, 8);
+            } // GDI+ released before GDI text
+
+            wchar_t text[64] = {};
+            GetWindowTextW(hwnd, text, 64);
+            HFONT oldf = (HFONT)SelectObject(mem, g_font);
+            SetBkMode(mem, TRANSPARENT);
+            SetTextColor(mem, textc);
+            RECT tr = { 0, 0, w, h };
+            DrawTextW(mem, text, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(mem, oldf);
+        });
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void register_controls(HINSTANCE hinst) {
+    static bool done = false;
+    if (done) return;
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = hinst;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+
+    wc.lpfnWndProc = xslider_proc;
+    wc.lpszClassName = XSLIDER_CLASS;
+    RegisterClassExW(&wc);
+
+    wc.lpfnWndProc = xtoggle_proc;
+    wc.lpszClassName = XTOGGLE_CLASS;
+    RegisterClassExW(&wc);
+
+    wc.lpfnWndProc = xbtn_proc;
+    wc.lpszClassName = XBTN_CLASS;
+    RegisterClassExW(&wc);
+    done = true;
+}
+
 static void init_resources() {
-    g_font       = CreateFontW(17, 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    g_font_title = CreateFontW(28, 0,0,0, FW_BOLD,    0,0,0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g_font       = CreateFontW(-16, 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g_font_sm    = CreateFontW(-13, 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g_font_title = CreateFontW(-26, 0,0,0, FW_BOLD,   0,0,0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g_font_sec   = CreateFontW(-13, 0,0,0, FW_BOLD,   0,0,0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
     g_bg_brush   = CreateSolidBrush(BG);
     g_card_brush = CreateSolidBrush(CARD);
     g_prev_brush = CreateSolidBrush(PREV);
@@ -34,65 +411,15 @@ SettingsWindow* SettingsWindow::get(HWND hwnd) {
     return it != g_map.end() ? it->second : nullptr;
 }
 
-// ---- trackbar subclass: smooth click-to-position + custom drag ----
-static LRESULT CALLBACK tb_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
-    static bool dragging = false;
-
-    auto set_thumb = [&](int pos, WPARAM code) {
-        int rmin = (int)SendMessage(hwnd, TBM_GETRANGEMIN, 0, 0);
-        int rmax = (int)SendMessage(hwnd, TBM_GETRANGEMAX, 0, 0);
-        if (pos < rmin) pos = rmin;
-        if (pos > rmax) pos = rmax;
-        SendMessage(hwnd, TBM_SETPOS, TRUE, pos);
-        HWND p = GetParent(hwnd);
-        SendMessage(p, WM_HSCROLL, MAKEWPARAM(code, pos), (LPARAM)hwnd);
-    };
-
-    if (msg == WM_LBUTTONDOWN) {
-        RECT rc; GetClientRect(hwnd, &rc);
-        int x = (int)(short)LOWORD(lp);
-        int rmin = (int)SendMessage(hwnd, TBM_GETRANGEMIN, 0, 0);
-        int rmax = (int)SendMessage(hwnd, TBM_GETRANGEMAX, 0, 0);
-        int thumb = (int)SendMessage(hwnd, TBM_GETTHUMBLENGTH, 0, 0);
-        int range = rmax - rmin; if (range == 0) range = 1;
-        int avail = rc.right - rc.left - thumb; if (avail <= 0) avail = 1;
-
-        int cur_val = (int)SendMessage(hwnd, TBM_GETPOS, 0, 0);
-        int cur_x = thumb/2 + (cur_val - rmin) * avail / range;
-
-        if (abs(x - cur_x) <= thumb * 3) {
-            // Start custom drag
-            dragging = true;
-            SetCapture(hwnd);
-            return 0;
-        }
-        // Click on channel: jump (use THUMBPOSITION so overlay updates)
-        set_thumb(rmin + (x - thumb/2) * range / avail, SB_THUMBPOSITION);
-        return 0;
-    }
-
-    if (msg == WM_MOUSEMOVE && dragging) {
-        RECT rc; GetClientRect(hwnd, &rc);
-        int x = (int)(short)LOWORD(lp);
-        int rmin = (int)SendMessage(hwnd, TBM_GETRANGEMIN, 0, 0);
-        int rmax = (int)SendMessage(hwnd, TBM_GETRANGEMAX, 0, 0);
-        int thumb = (int)SendMessage(hwnd, TBM_GETTHUMBLENGTH, 0, 0);
-        int range = rmax - rmin; if (range == 0) range = 1;
-        int avail = rc.right - rc.left - thumb; if (avail <= 0) avail = 1;
-        set_thumb(rmin + (x - thumb/2) * range / avail, SB_THUMBTRACK);
-        return 0;
-    }
-
-    if (msg == WM_LBUTTONUP && dragging) {
-        dragging = false;
-        ReleaseCapture();
-        int pos = (int)SendMessage(hwnd, TBM_GETPOS, 0, 0);
-        HWND p = GetParent(hwnd);
-        SendMessage(p, WM_HSCROLL, MAKEWPARAM(SB_THUMBPOSITION, pos), (LPARAM)hwnd);
-        return 0;
-    }
-
-    return DefSubclassProc(hwnd, msg, wp, lp);
+// ---- helpers for creating controls ----
+static HWND mk_label(HWND parent, HINSTANCE hinst, const wchar_t* text, int x, int y, int w, int h, HFONT f) {
+    HWND s = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, h, parent, nullptr, hinst, nullptr);
+    SendMessage(s, WM_SETFONT, (WPARAM)f, TRUE);
+    return s;
+}
+static HWND mk_btn(HWND parent, HINSTANCE hinst, const wchar_t* text, int x, int y, int w, int h, int id, int style = 0) {
+    return CreateWindowW(XBTN_CLASS, text, WS_CHILD | WS_VISIBLE, x, y, w, h,
+        parent, (HMENU)(INT_PTR)id, hinst, (LPVOID)(INT_PTR)style);
 }
 
 // ---- main window proc ----
@@ -116,6 +443,14 @@ LRESULT CALLBACK SettingsWindow::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
         FillRect((HDC)wp, &r, g_bg_brush);
         return 1;
     }
+    case WM_GETMINMAXINFO: {
+        RECT wr = { 0, 0, self->m_window_w, self->m_window_h };
+        AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_SIZEBOX, FALSE);
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        mmi->ptMinTrackSize.x = wr.right - wr.left;
+        mmi->ptMinTrackSize.y = wr.bottom - wr.top;
+        return 0;
+    }
     case WM_CTLCOLORSTATIC: {
         SetBkColor((HDC)wp, BG);
         SetTextColor((HDC)wp, TEXT_C);
@@ -127,23 +462,47 @@ LRESULT CALLBACK SettingsWindow::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
         return (LRESULT)g_bg_brush;
     }
     case WM_CTLCOLOREDIT: {
-        SetBkColor((HDC)wp, PREV);
+        SetBkColor((HDC)wp, CARD);
         SetTextColor((HDC)wp, TEXT_C);
-        return (LRESULT)g_prev_brush;
+        return (LRESULT)g_card_brush;
     }
     case WM_CTLCOLORLISTBOX: {
         SetBkColor((HDC)wp, PREV);
         SetTextColor((HDC)wp, TEXT_C);
         return (LRESULT)g_prev_brush;
     }
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)lp;
+        if (mi->CtlID == ID_PRESET_LIST) mi->itemHeight = 28;
+        return TRUE;
+    }
     case WM_DROPFILES:
         self->on_dropfile((HDROP)wp);
         return 0;
-    case WM_SIZE: {
-        // On resize, invalidate preview to redraw
+    case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) { self->to_tray(); return 0; }
         InvalidateRect(self->m_preview_area, nullptr, TRUE);
         return 0;
-    }
+    case WM_TRAYICON:
+        if (lp == WM_LBUTTONUP) {
+            self->from_tray();
+        } else if (lp == WM_RBUTTONUP) {
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, ID_TRAY_SHOW, L"打开设置");
+            AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"退出");
+            POINT pt; GetCursorPos(&pt);
+            SetForegroundWindow(hwnd); // required so menu dismisses correctly
+            TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(menu);
+        }
+        return 0;
+    case WM_TIMER:
+        if (wp == TIMER_UPDATE) {
+            KillTimer(hwnd, TIMER_UPDATE);
+            self->update_preview();
+            self->update_overlay();
+        }
+        return 0;
     case WM_COMMAND:
         self->on_command(LOWORD(wp), HIWORD(wp));
         return 0;
@@ -154,6 +513,7 @@ LRESULT CALLBACK SettingsWindow::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
         self->on_drawitem(wp, lp);
         return 0;
     case WM_DESTROY:
+        self->tray_cleanup();
         g_map.erase(hwnd);
         PostQuitMessage(0);
         return 0;
@@ -165,6 +525,7 @@ LRESULT CALLBACK SettingsWindow::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 void SettingsWindow::create(HINSTANCE hinst, AppCfg& cfg, OverlayManager& overlay) {
     m_hinst = hinst; m_cfg = &cfg; m_overlay = &overlay;
     init_resources();
+    register_controls(hinst);
     InitCommonControls();
 
     WNDCLASSEXW wc = {};
@@ -173,186 +534,181 @@ void SettingsWindow::create(HINSTANCE hinst, AppCfg& cfg, OverlayManager& overla
     wc.hInstance = hinst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = g_bg_brush;
+    wc.hIcon = LoadIconW(hinst, MAKEINTRESOURCEW(IDI_ICON1));
+    wc.hIconSm = wc.hIcon;
     wc.lpszClassName = L"CrosshairSettings";
     RegisterClassExW(&wc);
 
-    RECT wr = {0, 0, m_window_w, m_window_h};
-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    DWORD wstyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_SIZEBOX;
+    RECT wr = { 0, 0, m_window_w, m_window_h };
+    AdjustWindowRect(&wr, wstyle, FALSE);
+    int winw = wr.right - wr.left, winh = wr.bottom - wr.top;
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
 
+    // Launch at right side of screen
     m_hwnd = CreateWindowExW(0, L"CrosshairSettings", L"Crosshair v3",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_SIZEBOX,
-        sw - wr.right + wr.left - 30, (std::max)(0, (int)(sh - (wr.bottom - wr.top) - 40)),
-        wr.right - wr.left, wr.bottom - wr.top,
+        wstyle, sw - winw - 30, (std::max)(0, (sh - winh) / 2), winw, winh,
         nullptr, nullptr, hinst, this);
+
+    // Dark title bar (20 = Win11/Win10 20H1+, 19 = older Win10)
+    BOOL dark = TRUE;
+    if (FAILED(DwmSetWindowAttribute(m_hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark))))
+        DwmSetWindowAttribute(m_hwnd, 19, &dark, sizeof(dark));
 
     DragAcceptFiles(m_hwnd, TRUE);
 
-    // ---- Build UI directly on m_hwnd ----
-    int y = 12;
-    int x0 = 16;
+    const int x0 = 20, cw = 360; // content x / width
 
-    // Title + links
-    HWND title = CreateWindowW(L"STATIC", L"Crosshair",
-        WS_CHILD | WS_VISIBLE, x0, y, 120, 30, m_hwnd, nullptr, hinst, nullptr);
-    SendMessage(title, WM_SETFONT, (WPARAM)g_font_title, TRUE);
-    // B站 link
-    HWND bili = CreateWindowW(L"BUTTON", L"B站",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        250, y + 2, 36, 24, m_hwnd, (HMENU)(INT_PTR)ID_BILIBILI, hinst, nullptr);
-    // GitHub link
-    HWND gh = CreateWindowW(L"BUTTON", L"GitHub",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        290, y + 2, 50, 24, m_hwnd, (HMENU)(INT_PTR)ID_GITHUB, hinst, nullptr);
-    y += 32;
+    // ===== Header =====
+    mk_label(m_hwnd, hinst, L"Crosshair v3", x0, 14, 240, 32, g_font_title);
+    mk_btn(m_hwnd, hinst, L"B站",    268, 20, 44, 26, ID_BILIBILI, 2);
+    mk_btn(m_hwnd, hinst, L"GitHub", 318, 20, 62, 26, ID_GITHUB, 2);
 
-    // Multi-layer checkbox
-    m_ml_check = CreateWindowW(L"BUTTON", L"启用多层准星",
-        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        x0, y, 200, 26, m_hwnd, (HMENU)(INT_PTR)ID_ML_CHECK, hinst, nullptr);
-    SetWindowTheme(m_ml_check, L"", L"");
-    SendMessage(m_ml_check, WM_SETFONT, (WPARAM)g_font, TRUE);
-    if (cfg.multi_layer) SendMessage(m_ml_check, BM_SETCHECK, BST_CHECKED, 0);
-    y += 36;
+    // ===== Multi-layer toggle =====
+    m_ml_toggle = CreateWindowW(XTOGGLE_CLASS, L"", WS_CHILD | WS_VISIBLE,
+        x0, 56, 46, 26, m_hwnd, (HMENU)(INT_PTR)ID_ML_CHECK, hinst, nullptr);
+    mk_label(m_hwnd, hinst, L"启用多层准星", 76, 58, 200, 22, g_font);
+    if (cfg.multi_layer) SendMessage(m_ml_toggle, BM_SETCHECK, BST_CHECKED, 0);
 
-    // Layer area: eye toggle button + layer name button
+    // ===== Layer tabs =====
     for (int i = 0; i < 3; i++) {
+        int gx = x0 + i * 124;
         m_layer_eyes[i] = CreateWindowW(L"BUTTON", L"",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            x0 + i * 105, y, 24, 28, m_hwnd, (HMENU)(INT_PTR)(ID_LAYER_EYE0 + i), hinst, nullptr);
+            gx, 90, 28, 30, m_hwnd, (HMENU)(INT_PTR)(ID_LAYER_EYE0 + i), hinst, nullptr);
         wchar_t lbuf[16];
         swprintf(lbuf, 16, L"图层 %d", i + 1);
-        HWND lb = CreateWindowW(L"BUTTON", lbuf,
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            x0 + i * 105 + 26, y, 72, 28, m_hwnd, (HMENU)(INT_PTR)(ID_LAYER_BTN0 + i), hinst, nullptr);
-        m_layer_btns[i] = lb;
+        m_layer_btns[i] = CreateWindowW(XBTN_CLASS, lbuf,
+            WS_CHILD | WS_VISIBLE,
+            gx + 30, 90, 82, 30, m_hwnd, (HMENU)(INT_PTR)(ID_LAYER_BTN0 + i), hinst, nullptr);
     }
-    y += 36;
 
-    // Preview
+    // ===== Preview =====
     m_preview_area = CreateWindowW(L"STATIC", L"",
         WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
-        x0, y, 308, 64, m_hwnd, (HMENU)(INT_PTR)ID_PREVIEW, hinst, nullptr);
-    y += 74;
+        x0, 132, cw, 88, m_hwnd, (HMENU)(INT_PTR)ID_PREVIEW, hinst, nullptr);
 
-    // Style radios: BS_AUTORADIOBUTTON, WS_GROUP on first
+    // ===== Style section =====
+    mk_label(m_hwnd, hinst, L"样式", x0, 228, 200, 18, g_font_sec)
+        ;
     const wchar_t* style_names[] = { L"十字", L"圆圈", L"圆点", L"实心十字", L"四角", L"三角", L"图片", L"空心" };
     for (int i = 0; i < 8; i++) {
-        DWORD st = WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON;
-        if (i == 0) st |= WS_GROUP;
-        m_style_radios[i] = CreateWindowW(L"BUTTON", style_names[i],
-            st, x0 + (i % 3) * 100, y + (i / 3) * 28, 90, 22,
+        m_style_btns[i] = CreateWindowW(XBTN_CLASS, style_names[i],
+            WS_CHILD | WS_VISIBLE,
+            x0 + (i % 4) * 92, 250 + (i / 4) * 36, 84, 28,
             m_hwnd, (HMENU)(INT_PTR)(ID_STYLE0 + i), hinst, nullptr);
-        SetWindowTheme(m_style_radios[i], L"", L"");
-        SendMessage(m_style_radios[i], WM_SETFONT, (WPARAM)g_font, TRUE);
     }
-    y += 110;
 
-    // Image picker
-    m_img_label = CreateWindowW(L"STATIC", L"未选择图片",
-        WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
-        x0, y + 2, 210, 22, m_hwnd, nullptr, hinst, nullptr);
-    SendMessage(m_img_label, WM_SETFONT, (WPARAM)g_font, TRUE);
-    HWND pick_btn = CreateWindowW(L"BUTTON", L"选择PNG",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        x0 + 215, y, 85, 26, m_hwnd, (HMENU)(INT_PTR)ID_PICK_IMG, hinst, nullptr);
-    y += 36;
+    // ===== Image picker =====
+    m_img_label = mk_label(m_hwnd, hinst, L"未选择图片 · 可拖拽 PNG 到窗口", x0, 324, 250, 22, g_font_sm);
+    mk_btn(m_hwnd, hinst, L"选择图片", 280, 320, 100, 28, ID_PICK_IMG);
 
-    // Color swatches (owner-draw)
+    // ===== Colors =====
+    mk_label(m_hwnd, hinst, L"颜色", x0, 356, 200, 18, g_font_sec);
     for (int i = 0; i < 8; i++) {
         m_color_btns[i] = CreateWindowW(L"BUTTON", L"",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            x0 + i * 38, y, 30, 30, m_hwnd, (HMENU)(INT_PTR)(ID_COLOR0 + i), hinst, nullptr);
+            21 + i * 48, 378, 32, 32, m_hwnd, (HMENU)(INT_PTR)(ID_COLOR0 + i), hinst, nullptr);
     }
-    y += 44;
 
-    // Sliders with labels and edit boxes
-    const wchar_t* sl_names[]  = { L"尺寸", L"粗细", L"间隙", L"旋转", L"透明度" };
-    const int sl_mins[]  = {1, 1, 0, 0, 20};
-    const int sl_maxs[]  = {500, 30, 100, 360, 100};
-    for (int i = 0; i < 5; i++) {
-        HWND lb = CreateWindowW(L"STATIC", sl_names[i],
-            WS_CHILD | WS_VISIBLE, x0, y + 2, 50, 22, m_hwnd, nullptr, hinst, nullptr);
-        SendMessage(lb, WM_SETFONT, (WPARAM)g_font, TRUE);
-
-        m_sliders[i] = CreateWindowW(TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-            x0 + 56, y, 150, 28, m_hwnd, (HMENU)(INT_PTR)(ID_SLIDER0 + i), hinst, nullptr);
+    // ===== Params =====
+    mk_label(m_hwnd, hinst, L"参数", x0, 420, 200, 18, g_font_sec);
+    const wchar_t* sl_names[] = { L"尺寸", L"粗细", L"间隙", L"旋转", L"透明度", L"位移 X", L"位移 Y" };
+    const int sl_mins[] = { 1, 1, 0, 0, 20, -300, -300 };
+    const int sl_maxs[] = { 500, 30, 100, 360, 100, 300, 300 };
+    for (int i = 0; i < 7; i++) {
+        int y = 444 + i * 32;
+        mk_label(m_hwnd, hinst, sl_names[i], x0, y + 3, 52, 20, g_font_sm);
+        m_sliders[i] = CreateWindowW(XSLIDER_CLASS, L"",
+            WS_CHILD | WS_VISIBLE,
+            76, y, 224, 26, m_hwnd, (HMENU)(INT_PTR)(ID_SLIDER0 + i), hinst, nullptr);
         SendMessage(m_sliders[i], TBM_SETRANGE, TRUE, MAKELONG(sl_mins[i], sl_maxs[i]));
-        SetWindowSubclass(m_sliders[i], tb_subclass, 0, 0);
 
-        m_slider_edits[i] = CreateWindowW(L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_CENTER | ES_NUMBER,
-            x0 + 212, y, 50, 24, m_hwnd, (HMENU)(INT_PTR)(ID_SLIDER_EDIT0 + i), hinst, nullptr);
-        y += 32;
+        DWORD est = WS_CHILD | WS_VISIBLE | ES_CENTER;
+        if (i != SL_OFFX && i != SL_OFFY) est |= ES_NUMBER;
+        m_slider_edits[i] = CreateWindowW(L"EDIT", L"", est,
+            310, y, 70, 26, m_hwnd, (HMENU)(INT_PTR)(ID_SLIDER_EDIT0 + i), hinst, nullptr);
+        SendMessage(m_slider_edits[i], WM_SETFONT, (WPARAM)g_font_sm, TRUE);
+        SetWindowTheme(m_slider_edits[i], L"DarkMode_Explorer", nullptr);
     }
 
-    // Position sliders
-    const wchar_t* pos_names[] = { L"位移X", L"位移Y" };
-    for (int i = 0; i < 2; i++) {
-        int idx = SL_OFFX + i;
-        HWND lb = CreateWindowW(L"STATIC", pos_names[i],
-            WS_CHILD | WS_VISIBLE, x0, y + 2, 50, 22, m_hwnd, nullptr, hinst, nullptr);
-        SendMessage(lb, WM_SETFONT, (WPARAM)g_font, TRUE);
-
-        m_sliders[idx] = CreateWindowW(TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-            x0 + 56, y, 150, 28, m_hwnd, (HMENU)(INT_PTR)(ID_SLIDER0 + idx), hinst, nullptr);
-        SendMessage(m_sliders[idx], TBM_SETRANGE, TRUE, MAKELONG(-300, 300));
-        SetWindowSubclass(m_sliders[idx], tb_subclass, 0, 0);
-
-        m_slider_edits[idx] = CreateWindowW(L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_CENTER,
-            x0 + 212, y, 50, 24, m_hwnd, (HMENU)(INT_PTR)(ID_SLIDER_EDIT0 + idx), hinst, nullptr);
-        y += 32;
-    }
-
-    // Presets list
+    // ===== Presets =====
+    mk_label(m_hwnd, hinst, L"预设", x0, 672, 200, 18, g_font_sec);
     m_preset_list = CreateWindowW(L"LISTBOX", L"",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOTIFY | WS_VSCROLL,
-        x0, y, 308, 150, m_hwnd, (HMENU)(INT_PTR)ID_PRESET_LIST, hinst, nullptr);
+        WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_VSCROLL,
+        x0, 694, 224, 122, m_hwnd, (HMENU)(INT_PTR)ID_PRESET_LIST, hinst, nullptr);
     SendMessage(m_preset_list, WM_SETFONT, (WPARAM)g_font, TRUE);
-    y += 158;
+    SetWindowTheme(m_preset_list, L"DarkMode_Explorer", nullptr);
 
-    // Preset buttons
-    CreateWindowW(L"BUTTON", L"保存预设",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x0,       y, 70, 26, m_hwnd, (HMENU)(INT_PTR)ID_SAVE_PRESET, hinst, nullptr);
-    CreateWindowW(L"BUTTON", L"加载",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x0 + 74,  y, 55, 26, m_hwnd, (HMENU)(INT_PTR)ID_LOAD_PRESET, hinst, nullptr);
-    CreateWindowW(L"BUTTON", L"删除",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x0 + 133, y, 55, 26, m_hwnd, (HMENU)(INT_PTR)ID_DEL_PRESET, hinst, nullptr);
-    CreateWindowW(L"BUTTON", L"重置",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x0 + 192, y, 55, 26, m_hwnd, (HMENU)(INT_PTR)ID_RESET, hinst, nullptr);
-    y += 36;
+    mk_btn(m_hwnd, hinst, L"保存预设", 254, 694, 126, 26, ID_SAVE_PRESET);
+    mk_btn(m_hwnd, hinst, L"加载",     254, 726, 126, 26, ID_LOAD_PRESET);
+    mk_btn(m_hwnd, hinst, L"删除",     254, 758, 126, 26, ID_DEL_PRESET);
+    mk_btn(m_hwnd, hinst, L"重置图层", 254, 790, 126, 26, ID_RESET);
 
-    // Action buttons
-    CreateWindowW(L"BUTTON", L"显示/隐藏",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x0,       y, 90, 28, m_hwnd, (HMENU)(INT_PTR)ID_TOGGLE, hinst, nullptr);
-    CreateWindowW(L"BUTTON", L"应用",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x0 + 99,  y, 70, 28, m_hwnd, (HMENU)(INT_PTR)ID_APPLY, hinst, nullptr);
-    CreateWindowW(L"BUTTON", L"退出设置",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, x0 + 179, y, 90, 28, m_hwnd, (HMENU)(INT_PTR)ID_HIDE, hinst, nullptr);
-    y += 36;
+    // ===== Actions =====
+    mk_btn(m_hwnd, hinst, L"显示 / 隐藏", x0,  828, 113, 32, ID_TOGGLE);
+    mk_btn(m_hwnd, hinst, L"应用",        143, 828, 113, 32, ID_APPLY, 1);
+    mk_btn(m_hwnd, hinst, L"退出设置",    266, 828, 113, 32, ID_HIDE);
 
-    // ---- Hotkey info ----
-    HWND hk;
-    hk = CreateWindowW(L"STATIC", L"键盘快捷键", WS_CHILD|WS_VISIBLE, x0, y+4, 100, 20, m_hwnd, nullptr, hinst, nullptr);
-    SendMessage(hk, WM_SETFONT, (WPARAM)g_font, TRUE);
-    hk = CreateWindowW(L"STATIC", L"Ctrl+Shift+F1   开关图层 1", WS_CHILD|WS_VISIBLE, x0+4, y+26, 220, 18, m_hwnd, nullptr, hinst, nullptr);
-    SendMessage(hk, WM_SETFONT, (WPARAM)g_font, TRUE);
-    hk = CreateWindowW(L"STATIC", L"Ctrl+Shift+F2   开关图层 2", WS_CHILD|WS_VISIBLE, x0+4, y+46, 220, 18, m_hwnd, nullptr, hinst, nullptr);
-    SendMessage(hk, WM_SETFONT, (WPARAM)g_font, TRUE);
-    hk = CreateWindowW(L"STATIC", L"Ctrl+Shift+F3   开关图层 3", WS_CHILD|WS_VISIBLE, x0+4, y+66, 220, 18, m_hwnd, nullptr, hinst, nullptr);
-    SendMessage(hk, WM_SETFONT, (WPARAM)g_font, TRUE);
+    // ===== Footer hotkey hint =====
+    HWND foot = mk_label(m_hwnd, hinst,
+        L"快捷键  Ctrl + Shift + F1 / F2 / F3   开关图层 1 / 2 / 3",
+        x0, 866, cw, 16, g_font_sm);
+    // gray footer text handled via WM_CTLCOLORSTATIC default
 
+    (void)foot;
     update_layer_btns();
     refresh_ui();
     update_preview();
     update_overlay();
 }
 
-void SettingsWindow::show() { ShowWindow(m_hwnd, SW_SHOW); }
+void SettingsWindow::show() {
+    BOOL dark = TRUE;
+    if (FAILED(DwmSetWindowAttribute(m_hwnd, 20, &dark, sizeof(dark))))
+        DwmSetWindowAttribute(m_hwnd, 19, &dark, sizeof(dark));
+    ShowWindow(m_hwnd, SW_SHOW);
+}
 void SettingsWindow::hide() { ShowWindow(m_hwnd, SW_HIDE); }
+
+// ---- system tray ----
+void SettingsWindow::to_tray() {
+    if (m_in_tray) return;
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = m_hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = LoadIconW(m_hinst, MAKEINTRESOURCEW(IDI_ICON1));
+    wcscpy_s(nid.szTip, L"Crosshair v3");
+    if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+        m_in_tray = true;
+        ShowWindow(m_hwnd, SW_HIDE);
+    }
+}
+
+void SettingsWindow::from_tray() {
+    if (!m_in_tray) return;
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = m_hwnd;
+    nid.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    m_in_tray = false;
+    ShowWindow(m_hwnd, SW_RESTORE);
+    SetForegroundWindow(m_hwnd);
+}
+
+void SettingsWindow::tray_cleanup() {
+    if (!m_in_tray) return;
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = m_hwnd;
+    nid.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    m_in_tray = false;
+}
 
 // ---- drop file ----
 void SettingsWindow::on_dropfile(HDROP drop) {
@@ -377,7 +733,6 @@ void SettingsWindow::on_dropfile(HDROP drop) {
     m_cfg->active().image_path = dest;
     m_cfg->active().style = "image";
     m_cfg->active().visible = true;
-    // Auto-size
     {
         auto* tmp = Gdiplus::Bitmap::FromFile(path);
         if (tmp && tmp->GetLastStatus() == Gdiplus::Ok) {
@@ -390,7 +745,7 @@ void SettingsWindow::on_dropfile(HDROP drop) {
     }
     if (m_cfg->active_layer > 0) {
         m_cfg->multi_layer = true;
-        SendMessage(m_ml_check, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessage(m_ml_toggle, BM_SETCHECK, BST_CHECKED, 0);
         update_layer_btns();
     }
     refresh_ui();
@@ -399,218 +754,203 @@ void SettingsWindow::on_dropfile(HDROP drop) {
     m_cfg->save();
 }
 
+// Preview image cache (per layer): avoid reloading PNG from disk on every repaint
+static Gdiplus::Bitmap* g_prev_img[3] = {};
+static std::string g_prev_img_key[3];
+static Gdiplus::Bitmap* preview_image(int idx, const LayerCfg& layer) {
+    char keybuf[40];
+    snprintf(keybuf, 40, "|%d|%d", layer.size, layer.angle);
+    std::string key = layer.image_path + keybuf;
+    if (g_prev_img[idx] && g_prev_img_key[idx] == key) return g_prev_img[idx];
+    delete g_prev_img[idx]; g_prev_img[idx] = nullptr; g_prev_img_key[idx].clear();
+    g_prev_img[idx] = load_crosshair_image(layer.image_path, layer.size, layer.angle);
+    if (g_prev_img[idx]) g_prev_img_key[idx] = key;
+    return g_prev_img[idx];
+}
+
 // ---- owner draw ----
 void SettingsWindow::on_drawitem(WPARAM wp, LPARAM lp) {
     DRAWITEMSTRUCT& di = *(DRAWITEMSTRUCT*)lp;
     int id = (int)wp;
 
-    // Layer eye toggle buttons
+    // ---- preset listbox items ----
+    if (id == ID_PRESET_LIST) {
+        HDC hdc = di.hDC;
+        RECT r = di.rcItem;
+        if (di.itemID == (UINT)-1) {
+            FillRect(hdc, &r, g_prev_brush);
+            return;
+        }
+        bool sel = (di.itemState & ODS_SELECTED) != 0;
+        int w = r.right - r.left, h = r.bottom - r.top;
+        paint_dc(hdc, r.left, r.top, w, h, [&](HDC mem, int, int) {
+            {
+                Gdiplus::Graphics g(mem);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                Gdiplus::SolidBrush bgbr(gcol(PREV));
+                g.FillRectangle(&bgbr, 0, 0, w, h);
+                if (sel) {
+                    Gdiplus::SolidBrush sbr(gcol(ACCENT));
+                    gdi_round_rect(g, &sbr, nullptr, 2, 2, w - 4.0f, h - 4.0f, 6);
+                }
+            }
+            wchar_t text[256] = {};
+            SendMessageW(di.hwndItem, LB_GETTEXT, di.itemID, (LPARAM)text);
+            HFONT oldf = (HFONT)SelectObject(mem, g_font);
+            SetBkMode(mem, TRANSPARENT);
+            SetTextColor(mem, TEXT_C);
+            RECT tr = { 12, 0, w - 8, h };
+            DrawTextW(mem, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(mem, oldf);
+        });
+        return;
+    }
+
+    // ---- layer eye toggles ----
     if (id >= ID_LAYER_EYE0 && id <= ID_LAYER_EYE2) {
         int idx = id - ID_LAYER_EYE0;
-        HDC hdc = di.hDC;
         RECT r = di.rcItem;
-
-        HBRUSH fill = CreateSolidBrush(BG);
-        FillRect(hdc, &r, fill);
-        DeleteObject(fill);
-
-        bool vis = m_cfg->layers[idx].visible;
-        int m = 4; // margin
-        int s = (r.right - r.left) - m * 2;
-
-        if (vis) {
-            // Green circle
-            HBRUSH gb = CreateSolidBrush(GREEN_C);
-            HPEN gp = CreatePen(PS_SOLID, 1, GREEN_C);
-            HGDIOBJ ob = SelectObject(hdc, gb);
-            HGDIOBJ op = SelectObject(hdc, gp);
-            Ellipse(hdc, r.left + m, r.top + m, r.left + m + s, r.top + m + s);
-            SelectObject(hdc, ob); SelectObject(hdc, op);
-            DeleteObject(gb); DeleteObject(gp);
-        } else {
-            // Just an X
-            HPEN xp = CreatePen(PS_SOLID, 2, RING);
-            HGDIOBJ op = SelectObject(hdc, xp);
-            MoveToEx(hdc, r.left + m + 2, r.top + m + 2, nullptr);
-            LineTo(hdc, r.right - m - 2, r.bottom - m - 2);
-            MoveToEx(hdc, r.right - m - 2, r.top + m + 2, nullptr);
-            LineTo(hdc, r.left + m + 2, r.bottom - m - 2);
-            SelectObject(hdc, op);
-            DeleteObject(xp);
-        }
-
-        if (di.itemState & ODS_SELECTED) {
-            HPEN fp = CreatePen(PS_SOLID, 1, ACCENT);
-            HGDIOBJ op2 = SelectObject(hdc, fp);
-            HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-            SelectObject(hdc, ob); SelectObject(hdc, op2);
-            DeleteObject(fp);
-        }
+        int w = r.right - r.left, h = r.bottom - r.top;
+        paint_dc(di.hDC, r.left, r.top, w, h, [&](HDC mem, int, int) {
+            Gdiplus::Graphics g(mem);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            Gdiplus::SolidBrush bgbr(gcol(BG));
+            g.FillRectangle(&bgbr, 0, 0, w, h);
+            bool vis = m_cfg->layers[idx].visible;
+            COLORREF c = vis ? GREEN_C : SUBT;
+            float cx = w / 2.0f, cy = h / 2.0f;
+            // eye outline
+            Gdiplus::Pen pen(gcol(c), 1.6f);
+            g.DrawEllipse(&pen, cx - 9.0f, cy - 5.5f, 18.0f, 11.0f);
+            if (vis) {
+                Gdiplus::SolidBrush pup(gcol(c));
+                g.FillEllipse(&pup, cx - 3.0f, cy - 3.0f, 6.0f, 6.0f);
+            } else {
+                // slash
+                Gdiplus::Pen sp(gcol(SUBT), 1.8f);
+                g.DrawLine(&sp, cx - 8.0f, cy + 7.0f, cx + 8.0f, cy - 7.0f);
+            }
+        });
         return;
     }
 
-    // B站 / GitHub link buttons
-    if (id == ID_BILIBILI || id == ID_GITHUB) {
-        HDC hdc = di.hDC;
-        RECT r = di.rcItem;
-
-        HBRUSH fill = CreateSolidBrush(BG);
-        FillRect(hdc, &r, fill);
-        DeleteObject(fill);
-
-        wchar_t text[32];
-        GetWindowTextW(di.hwndItem, text, 32);
-        HFONT uf = CreateFontW(15, 0,0,0, FW_NORMAL, 0,1,0, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        HFONT old_f = (HFONT)SelectObject(hdc, uf);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, ACCENT);
-        DrawTextW(hdc, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(hdc, old_f);
-        DeleteObject(uf);
-        return;
-    }
-
-    // Regular push buttons + layer name buttons
-    if ((id >= ID_PICK_IMG && id <= ID_PICK_IMG) ||
-        (id >= ID_SAVE_PRESET && id <= ID_RESET) ||
-        (id >= ID_TOGGLE && id <= ID_HIDE) ||
-        (id >= ID_LAYER_BTN0 && id <= ID_LAYER_BTN2)) {
-        HDC hdc = di.hDC;
-        RECT r = di.rcItem;
-
-        bool pressed = (di.itemState & ODS_SELECTED) != 0;
-        bool is_active_layer = (id >= ID_LAYER_BTN0 && id <= ID_LAYER_BTN2)
-            && (id - ID_LAYER_BTN0 == m_active_layer);
-        COLORREF bg = pressed ? ACCENT : (is_active_layer ? ACCENT : CARD);
-        HBRUSH fill = CreateSolidBrush(bg);
-        HPEN pen = CreatePen(PS_SOLID, 1, RING);
-        HGDIOBJ old_br = SelectObject(hdc, fill);
-        HGDIOBJ old_pen = SelectObject(hdc, pen);
-        RoundRect(hdc, r.left, r.top, r.right, r.bottom, 6, 6);
-        SelectObject(hdc, old_br); SelectObject(hdc, old_pen);
-        DeleteObject(fill); DeleteObject(pen);
-
-        wchar_t text[64];
-        GetWindowTextW(di.hwndItem, text, 64);
-        HFONT old_f = (HFONT)SelectObject(hdc, g_font);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, TEXT_C);
-        DrawTextW(hdc, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(hdc, old_f);
-
-        if (di.itemState & ODS_FOCUS) {
-            RECT fr = {r.left+3, r.top+3, r.right-3, r.bottom-3};
-            DrawFocusRect(hdc, &fr);
-        }
-        return;
-    }
-
-    // Color swatches
+    // ---- color swatches ----
     if (id >= ID_COLOR0 && id <= ID_COLOR7) {
-        HDC hdc = di.hDC;
+        int ci = id - ID_COLOR0;
         RECT r = di.rcItem;
+        int w = r.right - r.left, h = r.bottom - r.top;
+        paint_dc(di.hDC, r.left, r.top, w, h, [&](HDC mem, int, int) {
+            const char* hex_cols[] = { "#00FF00","#FF4444","#00D4FF","#FF44FF","#FFDD44","#FFFFFF","#FF8800" };
+            bool custom = (ci == 7);
+            float cx = w / 2.0f, cy = h / 2.0f, d = 20.0f;
 
-        HBRUSH fill = CreateSolidBrush(BG);
-        FillRect(hdc, &r, fill);
-        DeleteObject(fill);
+            {
+                Gdiplus::Graphics g(mem);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                Gdiplus::SolidBrush bgbr(gcol(BG));
+                g.FillRectangle(&bgbr, 0, 0, w, h);
 
-        COLORREF col = 0;
-        if (id == ID_COLOR7) {
-            col = RING;
-        } else {
-            const char* hex_cols[] = {"#00FF00","#FF4444","#00D4FF","#FF44FF","#FFDD44","#FFFFFF","#FF8800"};
-            std::string hex = hex_cols[id - ID_COLOR0];
-            unsigned int rr = strtoul(hex.substr(1,2).c_str(), nullptr, 16);
-            unsigned int gg = strtoul(hex.substr(3,2).c_str(), nullptr, 16);
-            unsigned int bb = strtoul(hex.substr(5,2).c_str(), nullptr, 16);
-            col = RGB(rr, gg, bb);
-        }
-
-        int m = 4;
-        RECT inner = {r.left + m, r.top + m, r.right - m, r.bottom - m};
-        HBRUSH cb = CreateSolidBrush(col);
-        HPEN pen = CreatePen(PS_SOLID, 1, RING);
-        HGDIOBJ old_br = SelectObject(hdc, cb);
-        HGDIOBJ old_pen = SelectObject(hdc, pen);
-        RoundRect(hdc, inner.left, inner.top, inner.right, inner.bottom, 6, 6);
-        SelectObject(hdc, old_br); SelectObject(hdc, old_pen);
-        DeleteObject(cb); DeleteObject(pen);
-
-        if (id == ID_COLOR7) {
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, TEXT_C);
-            DrawTextA(hdc, "+", 1, &inner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-
-        if (di.itemState & ODS_SELECTED) {
-            HPEN fp = CreatePen(PS_SOLID, 1, ACCENT);
-            old_pen = SelectObject(hdc, fp);
-            old_br = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-            SelectObject(hdc, old_br); SelectObject(hdc, old_pen);
-            DeleteObject(fp);
-        }
+                if (!custom) {
+                    std::string hex = hex_cols[ci];
+                    int rr = (int)strtoul(hex.substr(1, 2).c_str(), nullptr, 16);
+                    int gg = (int)strtoul(hex.substr(3, 2).c_str(), nullptr, 16);
+                    int bb = (int)strtoul(hex.substr(5, 2).c_str(), nullptr, 16);
+                    Gdiplus::SolidBrush cbr(Gdiplus::Color(255, (BYTE)rr, (BYTE)gg, (BYTE)bb));
+                    g.FillEllipse(&cbr, cx - d / 2, cy - d / 2, d, d);
+                    // selected ring
+                    if (m_cfg->active().color == hex_cols[ci]) {
+                        Gdiplus::Pen wp(Gdiplus::Color(255, 250, 250, 252), 2.0f);
+                        g.DrawEllipse(&wp, cx - d / 2 - 3, cy - d / 2 - 3, d + 6, d + 6);
+                    }
+                } else {
+                    Gdiplus::Pen gp(gcol(SUBT), 1.4f);
+                    gp.SetDashStyle(Gdiplus::DashStyleDash);
+                    g.DrawEllipse(&gp, cx - d / 2, cy - d / 2, d, d);
+                }
+            }
+            if (custom) {
+                SetBkMode(mem, TRANSPARENT);
+                SetTextColor(mem, SUBT);
+                HFONT oldf = (HFONT)SelectObject(mem, g_font);
+                RECT tr = { 0, 0, w, h };
+                DrawTextW(mem, L"+", 1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(mem, oldf);
+            }
+        });
         return;
     }
 
-    // Preview area
+    // ---- preview card ----
     if (id == ID_PREVIEW) {
         HDC hdc = di.hDC;
         RECT r = di.rcItem;
-
-        FillRect(hdc, &r, g_prev_brush);
-
-        // Use an offscreen bitmap to apply per-layer alpha
         int pw = r.right - r.left, ph = r.bottom - r.top;
-        Gdiplus::Bitmap offscreen(pw, ph, PixelFormat32bppARGB);
-        Gdiplus::Graphics offg(&offscreen);
-        offg.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-        RenderContext ctx; ctx.gfx = &offg;
+        if (pw < 4 || ph < 4) return;
 
-        float cx = pw / 2.0f, cy = ph / 2.0f;
+        HDC mem = CreateCompatibleDC(hdc);
+        HBITMAP bmp = CreateCompatibleBitmap(hdc, pw, ph);
+        HGDIOBJ ob = SelectObject(mem, bmp);
+        {
+            Gdiplus::Graphics g(mem);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            // card
+            Gdiplus::SolidBrush bgbr(gcol(BG));
+            g.FillRectangle(&bgbr, 0, 0, pw, ph);
+            Gdiplus::SolidBrush pbr(gcol(PREV));
+            Gdiplus::Pen bpn(gcol(RING), 1.0f);
+            gdi_round_rect(g, &pbr, &bpn, 0.5f, 0.5f, pw - 1.0f, ph - 1.0f, 10);
+            // dot grid
+            Gdiplus::SolidBrush gbr(gcol(GRID));
+            for (int gx = 10; gx < pw - 4; gx += 14)
+                for (int gy = 10; gy < ph - 4; gy += 14)
+                    g.FillRectangle(&gbr, (float)gx, (float)gy, 1.4f, 1.4f);
 
-        auto draw_layer_preview = [&](const LayerCfg& layer) {
-            if (!layer.visible) return;
-            Gdiplus::ColorMatrix cm = {};
-            cm.m[0][0] = 1; cm.m[1][1] = 1; cm.m[2][2] = 1;
-            cm.m[3][3] = layer.alpha; cm.m[4][4] = 1;
-            Gdiplus::ImageAttributes ia;
-            ia.SetColorMatrix(&cm);
+            // crosshair layers with alpha
+            Gdiplus::Bitmap offscreen(pw, ph, PixelFormat32bppARGB);
+            Gdiplus::Graphics offg(&offscreen);
+            offg.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+            RenderContext ctx; ctx.gfx = &offg;
 
-            if (layer.style == "image" && !layer.image_path.empty()) {
-                auto* bmp = load_crosshair_image(layer.image_path, layer.size, layer.angle);
-                if (bmp) {
-                    offg.DrawImage(bmp,
-                        Gdiplus::RectF(cx - bmp->GetWidth()/2.0f, cy - bmp->GetHeight()/2.0f,
-                                       (float)bmp->GetWidth(), (float)bmp->GetHeight()),
-                        0, 0, (float)bmp->GetWidth(), (float)bmp->GetHeight(),
-                        Gdiplus::UnitPixel, &ia);
-                    delete bmp;
+            float cx = pw / 2.0f, cy = ph / 2.0f;
+            auto draw_layer_preview = [&](int li, const LayerCfg& layer) {
+                if (!layer.visible) return;
+                Gdiplus::ColorMatrix cm = {};
+                cm.m[0][0] = 1; cm.m[1][1] = 1; cm.m[2][2] = 1;
+                cm.m[3][3] = (Gdiplus::REAL)layer.alpha; cm.m[4][4] = 1;
+                Gdiplus::ImageAttributes ia;
+                ia.SetColorMatrix(&cm);
+
+                if (layer.style == "image" && !layer.image_path.empty()) {
+                    auto* ib = preview_image(li, layer);
+                    if (ib) {
+                        offg.DrawImage(ib,
+                            Gdiplus::RectF(cx - ib->GetWidth() / 2.0f, cy - ib->GetHeight() / 2.0f,
+                                           (float)ib->GetWidth(), (float)ib->GetHeight()),
+                            0, 0, (float)ib->GetWidth(), (float)ib->GetHeight(),
+                            Gdiplus::UnitPixel, &ia);
+                    }
+                } else {
+                    Gdiplus::Bitmap tmp(pw, ph, PixelFormat32bppARGB);
+                    Gdiplus::Graphics tmpg(&tmp);
+                    tmpg.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+                    RenderContext tmpctx; tmpctx.gfx = &tmpg;
+                    draw_crosshair(tmpctx, layer, cx, cy);
+                    offg.DrawImage(&tmp, Gdiplus::Rect(0, 0, pw, ph),
+                        0, 0, pw, ph, Gdiplus::UnitPixel, &ia);
                 }
+            };
+
+            if (m_cfg->multi_layer) {
+                for (int i = 0; i < 3; i++) draw_layer_preview(i, m_cfg->layers[i]);
             } else {
-                // Draw vector crosshair offscreen, then blit with alpha
-                Gdiplus::Bitmap tmp(pw, ph, PixelFormat32bppARGB);
-                Gdiplus::Graphics tmpg(&tmp);
-                tmpg.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-                RenderContext tmpctx; tmpctx.gfx = &tmpg;
-                draw_crosshair(tmpctx, layer, cx, cy);
-                offg.DrawImage(&tmp, Gdiplus::Rect(0, 0, pw, ph),
-                    0, 0, pw, ph, Gdiplus::UnitPixel, &ia);
+                draw_layer_preview(m_cfg->active_layer, m_cfg->active());
             }
-        };
-
-        if (m_cfg->multi_layer) {
-            for (int i = 0; i < 3; i++)
-                draw_layer_preview(m_cfg->layers[i]);
-        } else {
-            draw_layer_preview(m_cfg->active());
+            g.DrawImage(&offscreen, 0, 0, pw, ph);
         }
-
-        // Blit offscreen to preview DC
-        Gdiplus::Graphics gfx(hdc);
-        gfx.DrawImage(&offscreen, r.left, r.top, pw, ph);
+        BitBlt(hdc, r.left, r.top, pw, ph, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, ob);
+        DeleteObject(bmp);
+        DeleteDC(mem);
         return;
     }
 }
@@ -622,8 +962,11 @@ void SettingsWindow::update_preview() {
 void SettingsWindow::update_overlay() {
     m_overlay->update(*m_cfg);
 }
+// Coalesce rapid updates (slider drags) into one redraw per ~16ms
+void SettingsWindow::schedule_update() {
+    SetTimer(m_hwnd, TIMER_UPDATE, 16, nullptr);
+}
 
-// ---- slider helpers ----
 static int slider_val(HWND sl) { return (int)SendMessage(sl, TBM_GETPOS, 0, 0); }
 static void slider_set(HWND sl, int v) { SendMessage(sl, TBM_SETPOS, TRUE, v); }
 static void edit_set(HWND ed, int v, bool pct) {
@@ -636,12 +979,12 @@ static void edit_set(HWND ed, int v, bool pct) {
 void SettingsWindow::refresh_ui() {
     auto& layer = m_cfg->active();
 
-    const char* st_names[] = {"cross","circle","dot","crosshair","corner","triangle","image","hollow"};
+    const char* st_names[] = { "cross","circle","dot","crosshair","corner","triangle","image","hollow" };
     int si = 0;
     for (int i = 0; i < 8; i++)
         if (layer.style == st_names[i]) { si = i; break; }
     for (int i = 0; i < 8; i++)
-        SendMessage(m_style_radios[i], BM_SETCHECK, i == si ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessage(m_style_btns[i], XBM_SETSELECT, i == si ? 1 : 0, 0);
 
     int vals[] = { layer.size, layer.thickness, layer.gap, layer.angle,
                    (int)(layer.alpha * 100), layer.offset_x, layer.offset_y };
@@ -655,7 +998,7 @@ void SettingsWindow::refresh_ui() {
         size_t pos = img.rfind('\\');
         SetWindowTextW(m_img_label, utf8_to_wstr(pos != std::string::npos ? img.substr(pos + 1) : img).c_str());
     } else {
-        SetWindowTextW(m_img_label, L"未选择图片");
+        SetWindowTextW(m_img_label, L"未选择图片 · 可拖拽 PNG 到窗口");
     }
 
     SendMessage(m_preset_list, LB_RESETCONTENT, 0, 0);
@@ -668,8 +1011,11 @@ void SettingsWindow::refresh_ui() {
     InvalidateRect(m_preview_area, nullptr, TRUE);
     for (int i = 0; i < 3; i++) {
         if (m_layer_eyes[i]) InvalidateRect(m_layer_eyes[i], nullptr, TRUE);
-        if (m_layer_btns[i]) InvalidateRect(m_layer_btns[i], nullptr, TRUE);
+        if (m_layer_btns[i]) SendMessage(m_layer_btns[i], XBM_SETSELECT,
+            (m_cfg->multi_layer && i == m_active_layer) ? 1 : 0, 0);
     }
+    for (int i = 0; i < 8; i++)
+        if (m_color_btns[i]) InvalidateRect(m_color_btns[i], nullptr, TRUE);
 }
 
 void SettingsWindow::update_layer_btns() {
@@ -677,6 +1023,7 @@ void SettingsWindow::update_layer_btns() {
     for (int i = 0; i < 3; i++) {
         ShowWindow(m_layer_eyes[i], ml ? SW_SHOW : SW_HIDE);
         ShowWindow(m_layer_btns[i], ml ? SW_SHOW : SW_HIDE);
+        SendMessage(m_layer_btns[i], XBM_SETSELECT, (ml && i == m_active_layer) ? 1 : 0, 0);
     }
     update_preview();
 }
@@ -689,8 +1036,10 @@ void SettingsWindow::sync_active_layer() {
 void SettingsWindow::on_command(WORD id, WORD notify) {
     auto& cfg = *m_cfg;
 
+    if (id == ID_TRAY_SHOW) { from_tray(); return; }
+    if (id == ID_TRAY_EXIT) { DestroyWindow(m_hwnd); return; }
     if (id == ID_ML_CHECK) {
-        cfg.multi_layer = (SendMessage(m_ml_check, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        cfg.multi_layer = (SendMessage(m_ml_toggle, BM_GETCHECK, 0, 0) == BST_CHECKED);
         sync_active_layer();
         update_layer_btns();
         refresh_ui();
@@ -710,12 +1059,12 @@ void SettingsWindow::on_command(WORD id, WORD notify) {
         return;
     }
     if (id >= ID_STYLE0 && id <= ID_STYLE0 + 7) {
-        if (notify == BN_CLICKED && SendMessage(m_style_radios[id - ID_STYLE0], BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            const char* names[] = {"cross","circle","dot","crosshair","corner","triangle","image","hollow"};
-            cfg.active().style = names[id - ID_STYLE0];
-            update_preview();
-            update_overlay();
-        }
+        const char* names[] = { "cross","circle","dot","crosshair","corner","triangle","image","hollow" };
+        cfg.active().style = names[id - ID_STYLE0];
+        for (int i = 0; i < 8; i++)
+            SendMessage(m_style_btns[i], XBM_SETSELECT, i == (int)(id - ID_STYLE0) ? 1 : 0, 0);
+        update_preview();
+        update_overlay();
         return;
     }
     if (id >= ID_COLOR0 && id <= ID_COLOR7) {
@@ -729,9 +1078,10 @@ void SettingsWindow::on_command(WORD id, WORD notify) {
                 cfg.active().color = buf;
             }
         } else {
-            const char* cols[] = {"#00FF00","#FF4444","#00D4FF","#FF44FF","#FFDD44","#FFFFFF","#FF8800"};
+            const char* cols[] = { "#00FF00","#FF4444","#00D4FF","#FF44FF","#FFDD44","#FFFFFF","#FF8800" };
             cfg.active().color = cols[id - ID_COLOR0];
         }
+        refresh_ui();
         update_preview();
         update_overlay();
         return;
@@ -746,8 +1096,10 @@ void SettingsWindow::on_command(WORD id, WORD notify) {
     if (id == ID_DEL_PRESET)    { delete_preset(); return; }
     if (id == ID_RESET)         { reset_layer(); return; }
     if (id == ID_TOGGLE) {
-        // Toggle active layer's visibility
-        toggle_layer_eye(m_cfg->active_layer);
+        // Master switch: hide/show the on-screen crosshair only; preview unaffected
+        cfg.overlay_visible = !cfg.overlay_visible;
+        update_overlay();
+        cfg.save();
         return;
     }
     if (id == ID_APPLY)         { cfg.save(); update_overlay(); return; }
@@ -779,7 +1131,7 @@ void SettingsWindow::on_hscroll(WORD code, int id) {
 
     edit_set(m_slider_edits[idx], raw, idx == SL_ALPHA);
     update_preview();
-    update_overlay();
+    schedule_update();
 }
 
 void SettingsWindow::on_slider_edit(int idx) {
@@ -797,7 +1149,7 @@ void SettingsWindow::on_slider_edit(int idx) {
         else m_cfg->active().offset_y = val;
         slider_set(m_sliders[idx], (std::min)(300, (std::max)(-300, val)));
     } else {
-        int mins[] = {1,1,0,0}, maxs[] = {500,30,100,360};
+        int mins[] = { 1,1,0,0 }, maxs[] = { 500,30,100,360 };
         if (val < mins[idx]) val = mins[idx];
         if (val > maxs[idx]) val = maxs[idx];
         if (idx == SL_SIZE)  m_cfg->active().size = val;
@@ -808,7 +1160,7 @@ void SettingsWindow::on_slider_edit(int idx) {
     }
 
     update_preview();
-    update_overlay();
+    schedule_update();
 }
 
 // ---- actions ----
@@ -823,14 +1175,13 @@ void SettingsWindow::pick_image() {
     if (GetOpenFileNameW(&ofn)) {
         std::string path = wstr_to_utf8(buf);
         size_t pos = path.rfind('\\');
-        std::string name = (pos != std::string::npos) ? path.substr(pos+1) : path;
+        std::string name = (pos != std::string::npos) ? path.substr(pos + 1) : path;
         std::string dest = AppCfg::img_dir() + "\\" + name;
         DeleteFileW(utf8_to_wstr(dest).c_str());
         CopyFileW(buf, utf8_to_wstr(dest).c_str(), FALSE);
         m_cfg->active().image_path = dest;
         m_cfg->active().style = "image";
         m_cfg->active().visible = true;
-        // Auto-size: ~100px max dimension initially (100 = 1x scale)
         {
             auto* tmp = Gdiplus::Bitmap::FromFile(buf);
             if (tmp && tmp->GetLastStatus() == Gdiplus::Ok) {
@@ -841,10 +1192,9 @@ void SettingsWindow::pick_image() {
             }
             delete tmp;
         }
-        // Auto-enable multi-layer if on layer 2/3
         if (m_cfg->active_layer > 0) {
             m_cfg->multi_layer = true;
-            SendMessage(m_ml_check, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessage(m_ml_toggle, BM_SETCHECK, BST_CHECKED, 0);
             update_layer_btns();
         }
         refresh_ui();
@@ -855,7 +1205,6 @@ void SettingsWindow::pick_image() {
 }
 
 void SettingsWindow::save_preset() {
-    // Register dialog class with dark theme
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW wc = {};
@@ -869,87 +1218,45 @@ void SettingsWindow::save_preset() {
         registered = true;
     }
 
-    int dlg_w = 260, dlg_h = 105;
+    int dlg_w = 280, dlg_h = 110;
     HWND dlg = CreateWindowExW(WS_EX_TOPMOST, L"CrosshairSaveDlg", L"保存预设",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
         0, 0, dlg_w, dlg_h, m_hwnd, nullptr, m_hinst, nullptr);
 
-    // Center on parent
+    // Dark title bar before showing, then force frame redraw
+    BOOL dark = TRUE;
+    if (FAILED(DwmSetWindowAttribute(dlg, 20, &dark, sizeof(dark))))
+        DwmSetWindowAttribute(dlg, 19, &dark, sizeof(dark));
+
     RECT pr; GetWindowRect(m_hwnd, &pr);
-    RECT dr = {0, 0, dlg_w, dlg_h};
+    RECT dr = { 0, 0, dlg_w, dlg_h };
     AdjustWindowRect(&dr, WS_CAPTION, FALSE);
     SetWindowPos(dlg, nullptr,
         pr.left + (pr.right - pr.left - (dr.right - dr.left)) / 2,
         pr.top + (pr.bottom - pr.top - (dr.bottom - dr.top)) / 2,
-        dr.right - dr.left, dr.bottom - dr.top, SWP_NOZORDER);
+        dr.right - dr.left, dr.bottom - dr.top,
+        SWP_NOZORDER | SWP_FRAMECHANGED);
 
-    // Label
-    HWND lb = CreateWindowW(L"STATIC", L"预设名称:",
-        WS_CHILD | WS_VISIBLE, 12, 14, 80, 22, dlg, nullptr, m_hinst, nullptr);
-    SendMessage(lb, WM_SETFONT, (WPARAM)g_font, TRUE);
-
-    // Edit box
-    HWND ed = CreateWindowW(L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-        90, 12, 155, 24, dlg, (HMENU)100, m_hinst, nullptr);
-    SendMessage(ed, WM_SETFONT, (WPARAM)g_font, TRUE);
-    SetWindowTheme(ed, L"DarkMode_Explorer", nullptr);
-    SetFocus(ed);
-
-    // Owner-draw buttons matching main UI style
-    CreateWindowW(L"BUTTON", L"确定",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        65, 48, 75, 28, dlg, (HMENU)1, m_hinst, nullptr);
-    CreateWindowW(L"BUTTON", L"取消",
-        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-        150, 48, 75, 28, dlg, (HMENU)2, m_hinst, nullptr);
-
-    // Shared state: result flag + name buffer, passed via GWLP_USERDATA
-    struct DlgData {
-        bool done = false;
-        wchar_t name[64] = {};
-    };
+    struct DlgData { bool done = false; wchar_t name[64] = {}; };
     DlgData data{};
 
-    // Subclass for dark theme, owner-draw, and dismiss
+    // Subclass BEFORE showing so first paint already uses dark colors
     SetWindowSubclass(dlg, [](HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) -> LRESULT {
         DlgData* d = (DlgData*)ref;
-
         if (msg == WM_CTLCOLORSTATIC) {
             SetBkColor((HDC)wp, BG);
             SetTextColor((HDC)wp, TEXT_C);
             return (LRESULT)g_bg_brush;
         }
         if (msg == WM_CTLCOLOREDIT) {
-            SetBkColor((HDC)wp, PREV);
+            SetBkColor((HDC)wp, CARD);
             SetTextColor((HDC)wp, TEXT_C);
-            return (LRESULT)g_prev_brush;
+            return (LRESULT)g_card_brush;
         }
         if (msg == WM_ERASEBKGND) {
             RECT r; GetClientRect(h, &r);
             FillRect((HDC)wp, &r, g_bg_brush);
             return 1;
-        }
-        if (msg == WM_DRAWITEM) {
-            DRAWITEMSTRUCT& di = *(DRAWITEMSTRUCT*)lp;
-            HDC hdc = di.hDC;
-            RECT r = di.rcItem;
-            bool pressed = (di.itemState & ODS_SELECTED) != 0;
-            COLORREF bg = pressed ? ACCENT : CARD;
-            HBRUSH fill = CreateSolidBrush(bg);
-            HPEN pen = CreatePen(PS_SOLID, 1, RING);
-            SelectObject(hdc, fill); SelectObject(hdc, pen);
-            RoundRect(hdc, r.left, r.top, r.right, r.bottom, 6, 6);
-            SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            SelectObject(hdc, GetStockObject(BLACK_PEN));
-            DeleteObject(fill); DeleteObject(pen);
-            wchar_t text[64];
-            GetWindowTextW(di.hwndItem, text, 64);
-            SelectObject(hdc, g_font);
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, TEXT_C);
-            DrawTextW(hdc, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            return 0;
         }
         if (msg == WM_COMMAND) {
             if (LOWORD(wp) == 1) {
@@ -963,7 +1270,6 @@ void SettingsWindow::save_preset() {
                 return 0;
             }
         }
-        // Handle close: X button, Alt+F4, etc.
         if (msg == WM_CLOSE || (msg == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_CLOSE)) {
             d->name[0] = 0;
             d->done = true;
@@ -972,7 +1278,25 @@ void SettingsWindow::save_preset() {
         return DefSubclassProc(h, msg, wp, lp);
     }, 0, (DWORD_PTR)&data);
 
-    // Non-modal loop: pump messages until dialog dismisses itself
+    // Create controls after subclassing, then show
+    HWND lb = CreateWindowW(L"STATIC", L"预设名称",
+        WS_CHILD | WS_VISIBLE, 14, 16, 70, 22, dlg, nullptr, m_hinst, nullptr);
+    SendMessage(lb, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+    HWND ed = CreateWindowW(L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        88, 14, 176, 26, dlg, (HMENU)100, m_hinst, nullptr);
+    SendMessage(ed, WM_SETFONT, (WPARAM)g_font, TRUE);
+    SetWindowTheme(ed, L"DarkMode_Explorer", nullptr);
+
+    HWND ok = CreateWindowW(XBTN_CLASS, L"确定",
+        WS_CHILD | WS_VISIBLE, 70, 54, 80, 28, dlg, (HMENU)1, m_hinst, (LPVOID)(INT_PTR)1);
+    CreateWindowW(XBTN_CLASS, L"取消",
+        WS_CHILD | WS_VISIBLE, 160, 54, 80, 28, dlg, (HMENU)2, m_hinst, nullptr);
+
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(ed);
+
     while (!data.done) {
         MSG m;
         if (GetMessage(&m, nullptr, 0, 0)) {
@@ -983,7 +1307,6 @@ void SettingsWindow::save_preset() {
         }
     }
 
-    // If confirmed with a non-empty name, save preset
     if (data.name[0]) {
         JsonObj pr;
         pr["multi_layer"] = m_cfg->multi_layer;
@@ -1020,7 +1343,7 @@ void SettingsWindow::load_preset() {
             m_cfg->layers[i] = LayerCfg::from_json(arr[i]);
     }
 
-    SendMessage(m_ml_check, BM_SETCHECK, m_cfg->multi_layer ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(m_ml_toggle, BM_SETCHECK, m_cfg->multi_layer ? BST_CHECKED : BST_UNCHECKED, 0);
     sync_active_layer();
     update_layer_btns();
     refresh_ui();
@@ -1051,7 +1374,6 @@ void SettingsWindow::reset_layer() {
 void SettingsWindow::reset_layer_by_idx(int idx) {
     if (idx < 0 || idx > 2) return;
     m_cfg->layers[idx] = LayerCfg();
-    // Set defaults matching Python version for layers 1/2
     if (idx == 1) { m_cfg->layers[1].color = "#FF4444"; m_cfg->layers[1].size = 15; m_cfg->layers[1].style = "dot"; }
     if (idx == 2) { m_cfg->layers[2].color = "#00D4FF"; m_cfg->layers[2].size = 10; m_cfg->layers[2].style = "circle"; m_cfg->layers[2].visible = false; }
     m_cfg->active_layer = idx;
@@ -1064,12 +1386,8 @@ void SettingsWindow::reset_layer_by_idx(int idx) {
 
 void SettingsWindow::toggle_layer_eye(int idx) {
     if (idx < 0 || idx > 2) return;
+    // Only toggle visibility; do NOT change the active layer
     m_cfg->layers[idx].visible = !m_cfg->layers[idx].visible;
-    // Also switch to this layer if in multi-layer mode
-    if (m_cfg->multi_layer) {
-        m_cfg->active_layer = idx;
-        sync_active_layer();
-    }
     refresh_ui();
     update_preview();
     update_overlay();

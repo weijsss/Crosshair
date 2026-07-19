@@ -170,6 +170,7 @@ void AppCfg::load() {
         if (j.contains("multi_layer")) multi_layer = j["multi_layer"].as_bool();
         if (j.contains("active_layer")) active_layer = j["active_layer"].as_int();
         if (j.contains("force_topmost")) force_topmost = j["force_topmost"].as_bool();
+        if (j.contains("overlay_visible")) overlay_visible = j["overlay_visible"].as_bool();
         if (j.contains("presets")) presets = j["presets"].as_obj(); // shallow copy
         if (j.contains("layers") && j["layers"].is_arr()) {
             auto& arr = j["layers"].as_arr();
@@ -185,6 +186,7 @@ void AppCfg::save() {
     j["multi_layer"] = multi_layer;
     j["active_layer"] = double(active_layer);
     j["force_topmost"] = force_topmost;
+    j["overlay_visible"] = overlay_visible;
     JsonArr la;
     for (int i = 0; i < 3; i++) la.push_back(layers[i].to_json());
     j["layers"] = la;

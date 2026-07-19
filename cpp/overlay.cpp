@@ -29,9 +29,7 @@ void OverlayManager::create(HWND parent, int sw, int sh) {
 void OverlayManager::destroy() {
     release_resources();
     for (int i = 0; i < 3; i++) {
-        if (m_dc[i]) { DeleteDC(m_dc[i]); m_dc[i] = nullptr; }
-        if (m_dib[i]) { DeleteObject(m_dib[i]); m_dib[i] = nullptr; }
-        m_bits[i] = nullptr; m_w[i] = m_h[i] = 0;
+        free_dib(i);
         if (m_hwnds[i]) { DestroyWindow(m_hwnds[i]); m_hwnds[i] = nullptr; }
     }
 }
@@ -51,15 +49,20 @@ void OverlayManager::set_force_topmost(bool v) {
     }
 }
 
-void OverlayManager::ensure_dib(int idx, int w, int h) {
-    w = (std::max)(1, w); h = (std::max)(1, h);
-    // Round up to 4px alignment for efficiency
-    w = (w + 3) & ~3;
-    if (w == m_w[idx] && h == m_h[idx]) return;
-
+void OverlayManager::free_dib(int idx) {
     if (m_dc[idx]) { DeleteDC(m_dc[idx]); m_dc[idx] = nullptr; }
     if (m_dib[idx]) { DeleteObject(m_dib[idx]); m_dib[idx] = nullptr; }
-    m_bits[idx] = nullptr;
+    m_bits[idx] = nullptr; m_w[idx] = m_h[idx] = 0;
+}
+
+void OverlayManager::ensure_dib(int idx, int w, int h) {
+    w = (std::max)(64, w); h = (std::max)(64, h);
+    // Quantize to 64px steps so slider drags don't reallocate every frame
+    w = (w + 63) & ~63;
+    h = (h + 63) & ~63;
+    if (w == m_w[idx] && h == m_h[idx]) return;
+
+    free_dib(idx);
 
     HDC screen_dc = GetDC(nullptr);
     m_dc[idx] = CreateCompatibleDC(screen_dc);
@@ -130,17 +133,19 @@ void OverlayManager::update(const AppCfg& cfg) {
     for (int i = 0; i < 3; i++) {
         if (!m_hwnds[i]) continue;
 
-        bool show = cfg.multi_layer ? cfg.layers[i].visible : (i == 0 && cfg.layers[i].visible);
+        bool show = cfg.overlay_visible &&
+            (cfg.multi_layer ? cfg.layers[i].visible : (i == 0 && cfg.layers[i].visible));
         BYTE alpha_val = show ? (BYTE)(cfg.layers[i].alpha * 255.0) : 0;
 
         if (alpha_val == 0) {
             ShowWindow(m_hwnds[i], SW_HIDE);
+            free_dib(i);  // release memory for hidden layers
             continue;
         }
 
         auto& layer = cfg.layers[i];
 
-        // Fixed DIB for vector (no resize → no flicker). Image gets exact size.
+        // Size DIB to actual content extent, not a fixed 1024
         int tw, th;
         if (layer.style == "image" && !layer.image_path.empty()) {
             auto* bmp = get_image(i, layer);
@@ -148,16 +153,18 @@ void OverlayManager::update(const AppCfg& cfg) {
                 tw = bmp->GetWidth();
                 th = bmp->GetHeight();
             } else {
-                tw = th = 512;
+                tw = th = 64;
             }
             if (tw > m_sw) tw = m_sw;
             if (th > m_sh) th = m_sh;
         } else {
-            tw = th = 1024;  // fixed: covers max size 500 + gap 100 + rotation
+            // extent = (size + gap + thickness) * sqrt(2) for rotation, + margin
+            float ext = (layer.size + layer.gap + layer.thickness) * 1.5f + 16.0f;
+            tw = th = (int)ext;
         }
 
         ensure_dib(i, tw, th);
-        tw = m_w[i]; th = m_h[i];  // use actual (rounded) size
+        tw = m_w[i]; th = m_h[i];  // use actual (quantized) size
         draw_layer(i, layer);
 
         int ox = layer.offset_x, oy = layer.offset_y;

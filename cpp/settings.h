@@ -28,10 +28,10 @@ private:
     AppCfg* m_cfg = nullptr;
     OverlayManager* m_overlay = nullptr;
 
-    HWND m_ml_check = nullptr;
+    HWND m_ml_toggle = nullptr;
     HWND m_layer_btns[3] = {};
     HWND m_layer_eyes[3] = {};
-    HWND m_style_radios[7] = {};
+    HWND m_style_btns[8] = {};
     HWND m_img_label = nullptr;
     HWND m_color_btns[8] = {};
     HWND m_sliders[7] = {};
@@ -40,7 +40,14 @@ private:
     HWND m_preview_area = nullptr;
 
     int m_active_layer = 0;
-    int m_window_w = 340, m_window_h = 960;
+    int m_window_w = 400, m_window_h = 898;
+    bool m_sync = false;    // guard: skip edit-change handling during programmatic sync
+    bool m_in_tray = false;
+
+    void to_tray();
+    void from_tray();
+    void tray_cleanup();
+    void schedule_update();
 
     static constexpr int SL_SIZE = 0, SL_THICK = 1, SL_GAP = 2, SL_ANGLE = 3, SL_ALPHA = 4;
     static constexpr int SL_OFFX = 5, SL_OFFY = 6;
@@ -66,7 +73,7 @@ enum {
     ID_LAYER_BTN0 = 1010, ID_LAYER_BTN1 = 1011, ID_LAYER_BTN2 = 1012,
     ID_LAYER_EYE0 = 1015, ID_LAYER_EYE1 = 1016, ID_LAYER_EYE2 = 1017,
     ID_STYLE0 = 1020,
-    ID_COLOR0 = 1030, ID_COLOR7 = 1037, ID_CUSTOM_C = 1038,
+    ID_COLOR0 = 1030, ID_COLOR7 = 1037,
     ID_SLIDER0 = 1040,
     ID_SLIDER_EDIT0 = 1050,
     ID_PICK_IMG = 1060,

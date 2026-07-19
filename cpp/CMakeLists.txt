@@ -22,6 +22,7 @@ add_executable(Crosshair
     render.cpp
     overlay.cpp
     settings.cpp
+    resource.rc
 )
 
 target_link_libraries(Crosshair gdiplus user32 gdi32 comctl32 comdlg32 ole32 shell32)

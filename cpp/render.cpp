@@ -119,20 +119,14 @@ void draw_crosshair(RenderContext& ctx, const LayerCfg& cfg, float cx, float cy)
         for (auto& p : pts) rot(p.X, p.Y, cx, cy, a);
         ctx.gfx->DrawPolygon(&pen, pts, 3);
     } else if (style == "hollow") {
-        // Hollow cross (plus sign outline)
+        // Hollow cross (plus sign)
         float w = s / 3.0f, h = s + g;
-        // Use two perpendicular rectangles drawn as outlines, or thick lines
         float hw = w, hh = h;
-        // Vertical bar
-        Gdiplus::RectF vbar(cx - hw, cy - hh, hw * 2, hh * 2);
-        // Horizontal bar
-        Gdiplus::RectF hbar(cx - hh, cy - hw, hh * 2, hw * 2);
         if (a != 0) {
-            // Rotate by drawing 4 corner points of each rect
-            // Simpler: just use thick lines
+            // Rotated: thick lines with flat caps so size matches the rect version
             Gdiplus::Pen thickPen(color, s / 1.5f);
-            thickPen.SetStartCap(Gdiplus::LineCapSquare);
-            thickPen.SetEndCap(Gdiplus::LineCapSquare);
+            thickPen.SetStartCap(Gdiplus::LineCapFlat);
+            thickPen.SetEndCap(Gdiplus::LineCapFlat);
             float x1 = cx, y1 = cy - h, x2 = cx, y2 = cy + h;
             rot(x1, y1, cx, cy, a); rot(x2, y2, cx, cy, a);
             ctx.gfx->DrawLine(&thickPen, x1, y1, x2, y2);

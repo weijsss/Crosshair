@@ -70,6 +70,7 @@ struct AppCfg {
     int active_layer = 0;
     LayerCfg layers[3];
     bool force_topmost = false;
+    bool overlay_visible = true;  // master show/hide for on-screen crosshair only
     JsonObj presets;
 
     void load();

@@ -27,6 +27,7 @@ private:
     int              m_sz[3] = {}, m_ang[3] = {};
 
     void ensure_dib(int idx, int w, int h);
+    void free_dib(int idx);
     void draw_layer(int idx, const LayerCfg& cfg);
     Gdiplus::Bitmap* get_image(int idx, const LayerCfg& layer);
     void release_resources();
